@@ -42,12 +42,15 @@ These files are expected to originate from the **Raw-to-Rawr-SLURM** repository.
 - Generates **PCoA plots** with ellipses.  
 - **Output:** distance metrics and figures in `results/`.  
 
-### **05_dbRDA_Spearman.R**
-- Aggregates data at **Family level**.  
-- Runs **Mantel test** and **db-RDA** with environmental variables.  
-- Computes **Spearman correlations** (*FDR correction*).  
-- Produces **heatmap** and **db-RDA biplot**.  
-- **Output:** Excel tables, heatmap, and biplot in `results/`.  
+### **05_dbRDA.R**
+- Assesses the effects of **soil properties** on **community composition**.  
+- Evaluates **multicollinearity among soil variables** using **Variance Inflation Factors (VIF)**.  
+- Reduces soil variable collinearity via **Principal Component Analysis (PCA)**.  
+- Runs **distance-based Redundancy Analysis (db-RDA)** using soil **PCs as predictors**.  
+- Applies **permutation tests blocked by sampling time**.  
+- Fits original soil variables using **envfit** for **visual interpretation only**.  
+- Produces a **db-RDA ordination biplot**.  
+- **Output:** Excel tables (VIF, PCA loadings, db-RDA statistics) and db-RDA figure in `results/`. 
 
 ### **06_ANCOMBC2.R**
 - Runs **ANCOM-BC2** differential abundance testing (*Organic vs. Conventional*).  
