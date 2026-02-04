@@ -1,196 +1,245 @@
-
-# Title: db-RDA and Spearman correlations (Family level)
-# Description: Aggregates data at the Family level, applies Hellinger 
-#              transformation, performs Mantel test, db-RDA with environmental 
-#              variables, and Spearman correlations. Generates heatmap and biplot.
+# Title: db-RDA of 16S or ITS community composition using soil PCs
+# Description: Evaluates the effects of soil properties on microbial community
+#              structure. Multicollinearity among soil variables is assessed
+#              using VIF, reduced via PCA, and tested using db-RDA. Permutations
+#              are blocked by sampling time. Environmental vectors are fitted
+#              for visualization only.
 # Author: Blanca Ruiz
 
-# Load packages
+## ---------------------------------------------------------
+## Load packages
+## ---------------------------------------------------------
+
 library(phyloseq)
-library(ggplot2)
 library(vegan)
-library(tidyr)
-library(dplyr)
-library(tibble)
+library(permute)
+library(ggplot2)
+library(ggnewscale)
+library(grid)        # for unit()
 library(openxlsx)
-library(reshape2)
-library(RColorBrewer)
-library(writexl)
-library(grid)   # for unit() used in arrow()
 
-# Ensure output folder exists
-if (!dir.exists("results")) dir.create("results", recursive = TRUE)
+## ---------------------------------------------------------
+## Ensure output directories exist
+## ---------------------------------------------------------
 
-# Load input data (change if needed)
-soil_16S_hellinger <- readRDS("data/soil_16S_hellinger.rds")
-distance_matrix    <- readRDS("data/distance_matrix_hellinger.rds")
-soil_16S_clean     <- readRDS("data/soil_16S_clean.rds")
+if (!dir.exists("results"))         dir.create("results")
+if (!dir.exists("results/figures")) dir.create("results/figures")
+if (!dir.exists("results/tables"))  dir.create("results/tables")
 
+## ---------------------------------------------------------
+## Load input data
+## ---------------------------------------------------------
 
-# 1) Aggregate abundances at Family level
+distance_matrix <- readRDS("data/distance_matrix_hellinger.rds")
+soil_16S_clean  <- readRDS("data/soil_16S_clean.rds")
 
-soil_16S_family <- tax_glom(soil_16S_clean, taxrank = "Family")
-family_abundance <- psmelt(soil_16S_family)
+meta <- as.data.frame(sample_data(soil_16S_clean))
 
-# Keep only required columns
-family_abundance <- family_abundance %>%
-  select(Sample, Abundance, Replicate, Sampling.time, Management, 
-         pH, Available_Water_Percent, Available_Phosphorus, C.N, 
-         Organic_matter, Nitrate, Family)
+## ---------------------------------------------------------
+## Define soil variables
+## ---------------------------------------------------------
 
-# Top 25 families + group others as "Other"
-top_families <- family_abundance %>%
-  group_by(Family) %>%
-  summarize(TotalAbundance = sum(Abundance)) %>%
-  top_n(25, TotalAbundance) %>%
-  pull(Family)
+soil_vars <- c("pH",
+               "Available_Water_Percent",
+               "Available_Phosphorus",
+               "C.N",
+               "Organic_matter",
+               "Nitrate")
 
-family_abundance_filtered <- family_abundance %>%
-  mutate(Family = ifelse(Family %in% top_families, Family, "Other")) %>%
-  group_by(Sample, Family) %>%
-  summarize(Abundance = sum(Abundance), .groups = "drop")
+# Sanity checks
+stopifnot(all(soil_vars %in% colnames(meta)))
+stopifnot("Sampling.time" %in% colnames(meta))
 
-# Convert to matrix
-family_matrix <- family_abundance_filtered %>%
-  pivot_wider(names_from = Family, values_from = Abundance, values_fill = 0) %>%
-  column_to_rownames(var = "Sample")
+env <- meta[, soil_vars]
 
-# Remove empty samples (all zeros) to avoid NaN in transforms
-family_matrix <- family_matrix[rowSums(family_matrix) > 0, ]
+## ---------------------------------------------------------
+## Check multicollinearity (VIF)
+## ---------------------------------------------------------
 
-# Apply Hellinger transformation (sqrt of relative abundance)
-family_matrix_hellinger <- decostand(family_matrix, method = "hellinger")
+env_z <- scale(env)
 
-# 2) Environmental data
+rda_env <- rda(env_z)
+vif_vals <- vif.cca(rda_env)
 
-environmental_data <- sample_data(soil_16S_clean)[
-  rownames(family_matrix_hellinger),  # align samples
-  c("pH", "Available_Water_Percent", "Available_Phosphorus", "C.N", "Organic_matter", "Nitrate")
-]
-environmental_data <- as.data.frame(environmental_data)
-
-# Scale environmental variables (unit variance, zero mean)
-environmental_data_scaled <- as.data.frame(scale(environmental_data))
-
-
-# 3) Mantel test (Bray vs Euclidean)
-
-env_dist_matrix    <- dist(environmental_data_scaled, method = "euclidean")
-family_dist_matrix <- vegdist(family_matrix_hellinger, method = "bray")
-
-mantel_result_families <- mantel(
-  family_dist_matrix, env_dist_matrix,
-  method = "spearman", permutations = 9999
-)
-print(mantel_result_families)
-
-
-# 4) db-RDA (capscale) with environmental variables
-
-db_rda_families <- capscale(
-  family_matrix_hellinger ~ pH + Available_Water_Percent + 
-    Available_Phosphorus + C.N + Organic_matter + Nitrate,
-  data = environmental_data_scaled, distance = "bray"
+vif_table <- data.frame(
+  Variable = names(vif_vals),
+  VIF      = round(vif_vals, 2)
 )
 
-# Permutational ANOVA: global and by terms (with FDR)
-anova_global_families <- anova(db_rda_families, permutations = 9999)
-anova_terms_families  <- anova(db_rda_families, by = "terms", permutations = 9999)
+vif_table
 
-p_values     <- anova_terms_families$`Pr(>F)`
-p_values_fdr <- p.adjust(p_values, method = "fdr")
-anova_terms_families_fdr <- cbind(anova_terms_families, p_value_fdr = p_values_fdr)
+write.xlsx(
+  vif_table,
+  file = "results/tables/Supplementary_Table_S0_Soil_VIF.xlsx",
+  rowNames = FALSE
+)
 
-# Save ANOVA-by-terms results
-write_xlsx(anova_terms_families_fdr, "results/dbRDA_anova_terms_families.xlsx")
+## ---------------------------------------------------------
+## PCA on soil variables
+## ---------------------------------------------------------
 
+pca_env <- rda(env_z)
 
-# 5) Spearman correlations (Families vs Environmental variables) + FDR
+PCs <- as.data.frame(scores(pca_env,
+                            display = "sites",
+                            choices = 1:2))
+colnames(PCs) <- c("Soil_PC1", "Soil_PC2")
 
-colnames(environmental_data_scaled) <- c("pH", "AWP", "P", "C:N", "OM", "N")
+dat <- cbind(meta, PCs)
 
-cor_results <- data.frame()
-for (family in colnames(family_matrix_hellinger)) {
-  for (variable in colnames(environmental_data_scaled)) {
-    cor_test <- cor.test(
-      family_matrix_hellinger[, family],
-      environmental_data_scaled[, variable],
-      method = "spearman"
-    )
-    cor_results <- rbind(cor_results, data.frame(
-      Family  = family,
-      Variable = variable,
-      Rho      = cor_test$estimate,
-      P_value  = cor_test$p.value
-    ))
-  }
-}
-cor_results$P_value_FDR <- p.adjust(cor_results$P_value, method = "fdr")
+## ---------------------------------------------------------
+## dbRDA: community ~ soil PCs
+## ---------------------------------------------------------
 
-# Keep only significant pairs (FDR < 0.05)
-cor_filtered <- cor_results %>%
-  filter(P_value_FDR < 0.05) %>%
-  mutate(Significance = case_when(
-    P_value_FDR < 0.001 ~ "***",
-    P_value_FDR < 0.01  ~ "**",
-    P_value_FDR < 0.05  ~ "*",
-    TRUE ~ ""
-  ))
+mod_pc <- capscale(
+  distance_matrix ~ Soil_PC1 + Soil_PC2,
+  data = dat,
+  add  = TRUE
+)
 
-# Save correlation table
-write.xlsx(cor_filtered, file = "results/spearman_correlations.xlsx", rowNames = FALSE)
+## ---------------------------------------------------------
+## Permutation design (blocked by sampling time)
+## ---------------------------------------------------------
 
+ctrl <- how(nperm = 9999)
+setBlocks(ctrl) <- dat$Sampling.time
 
-# 6) Heatmap of significant correlations
+anova(mod_pc, permutations = ctrl)
+anova(mod_pc, by = "margin", permutations = ctrl)
 
-if (nrow(cor_filtered) > 0) {
-  cor_matrix <- cor_filtered %>%
-    select(Family, Variable, Rho) %>%
-    pivot_wider(names_from = Variable, values_from = Rho, values_fill = 0) %>%
-    column_to_rownames("Family")
-  
-  family_dendro <- hclust(dist(cor_matrix), method = "average")
-  ordered_families <- family_dendro$labels[family_dendro$order]
-  cor_filtered$Family <- factor(cor_filtered$Family, levels = ordered_families)
-  
-  p <- ggplot(cor_filtered, aes(x = Variable, y = Family, fill = Rho)) +
-    geom_tile(width = 1, height = 1) +
-    scale_fill_gradient2(low = "#27408B", mid = "white", high = "#8B1A1A", midpoint = 0) +
-    geom_text(aes(label = Significance), color = "black", size = 5, fontface = "bold") +
-    theme_minimal(base_size = 14) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, size = 14, face = "bold"),
-      axis.text.y = element_text(size = 12, face = "italic"),
-      legend.position = "bottom"
-    )
-  ggsave("results/heatmap_spearman_families.pdf", plot = p, width = 6, height = 7)
-}
+## ---------------------------------------------------------
+## dbRDA ordination plot with envfit overlay
+## ---------------------------------------------------------
 
+# Percentage of constrained variance
+eig <- mod_pc$CCA$eig
+pct <- 100 * eig / sum(eig)
 
-# 7) db-RDA biplot
+x_label <- paste0("CAP1 (", round(pct[1], 1), "% constrained)")
+y_label <- paste0("CAP2 (", round(pct[2], 1), "% constrained)")
 
-species_coords <- scores(db_rda_families, display = "species", scaling = 2)
-env_coords     <- scores(db_rda_families, display = "bp",      scaling = 2)
-sites_df       <- as.data.frame(scores(db_rda_families, display = "sites", scaling = 2))
+# Site scores
+sites_df <- as.data.frame(scores(mod_pc,
+                                 display = "sites",
+                                 choices = 1:2))
+colnames(sites_df) <- c("CAP1", "CAP2")
 
-# Append minimal metadata for aesthetics
-sites_df <- cbind(sites_df, as.data.frame(sample_data(soil_16S_clean)[rownames(sites_df), ]))
+# Fit original soil variables (visual interpretation only)
+fit <- envfit(mod_pc,
+              dat[, soil_vars, drop = FALSE],
+              permutations = 9999)
 
-# Optional relabel for vectors in the plot
-rownames(env_coords) <- c("pH", "AWP", "P", "C:N", "OM", "N")
+env_vec <- as.data.frame(scores(fit, display = "vectors"))
+colnames(env_vec)[1:2] <- c("CAP1", "CAP2")
+env_vec$pval <- fit$vectors$pvals[rownames(env_vec)]
 
-p <- ggplot(sites_df, aes(x = CAP1, y = CAP2, color = Management, shape = Sampling.time)) +
-  geom_point(size = 4) +
-  geom_segment(data = as.data.frame(species_coords), inherit.aes = FALSE,
-               aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
-               arrow = arrow(length = unit(0.2, "cm")), color = "#EEAEEE", linewidth = 0.8) +
-  geom_segment(data = as.data.frame(env_coords), inherit.aes = FALSE,
-               aes(x = 0, y = 0, xend = CAP1, yend = CAP2),
-               arrow = arrow(length = unit(0.2, "cm")), color = "#53868B", linewidth = 0.8) +
+env_vec$PCgroup <- ifelse(abs(env_vec$CAP1) >= abs(env_vec$CAP2),
+                          "PC1", "PC2")
+
+arrow_scale <- max(abs(sites_df[, c("CAP1", "CAP2")])) * 0.8
+
+env_coords <- env_vec
+env_coords[, c("CAP1", "CAP2")] <-
+  env_coords[, c("CAP1", "CAP2")] * arrow_scale
+
+env_coords_adj <- env_coords
+env_coords_adj[, c("CAP1", "CAP2")] <-
+  env_coords_adj[, c("CAP1", "CAP2")] * 1.05
+
+abbr <- c(
+  "Available_Water_Percent" = "AWP",
+  "Available_Phosphorus"    = "P",
+  "Organic_matter"          = "OM",
+  "Nitrate"                 = "NO3",
+  "C.N"                     = "C:N",
+  "pH"                      = "pH"
+)
+
+rownames(env_coords)     <- abbr[rownames(env_coords)]
+rownames(env_coords_adj) <- abbr[rownames(env_coords_adj)]
+
+p <- ggplot(sites_df, aes(CAP1, CAP2)) +
+  geom_point(size = 3.3) +
+  labs(x = x_label, y = y_label) +
+  new_scale_color() +
+  geom_segment(data = env_coords,
+               aes(x = 0, y = 0,
+                   xend = CAP1, yend = CAP2,
+                   color = PCgroup),
+               arrow = arrow(length = unit(0.3, "cm")),
+               linewidth = 0.9) +
+  geom_text(data = env_coords_adj,
+            aes(label = rownames(env_coords_adj),
+                color = PCgroup),
+            size = 3.2,
+            fontface = "bold",
+            vjust = -0.5,
+            hjust = -0.1) +
+  scale_color_manual(values = c("PC1" = "#53868B",
+                                "PC2" = "#8B475D")) +
   theme_minimal(base_size = 12) +
-  labs(x = "CAP1", y = "CAP2") +
-  scale_color_manual(values = c("Organic" = "#9ACD32", "Conventional" = "#EE9A00")) +
-  scale_shape_manual(values = c("February" = 16, "May" = 15, "July" = 17, "October" = 18))
+  theme(
+    panel.grid   = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    axis.title   = element_text(face = "bold")
+  )
 
-ggsave("results/dbRDA_biplot_families.pdf", plot = p, width = 8, height = 6)
+p
+
+ggsave(
+  filename = "results/figures/Fig2c_dbRDA_soilPCs.pdf",
+  plot     = p,
+  width    = 10,
+  height   = 6.5,
+  dpi      = 300
+)
+
+## ---------------------------------------------------------
+## Supplementary tables
+## ---------------------------------------------------------
+
+eig_pca <- eigenvals(pca_env)
+var_exp <- eig_pca / sum(eig_pca) * 100
+
+var_table <- data.frame(
+  PC = c("PC1", "PC2"),
+  Variance_explained_percent = round(var_exp[1:2], 1)
+)
+
+loadings <- as.data.frame(scores(pca_env,
+                                 display = "species",
+                                 choices = 1:2))
+loadings$Variable <- rownames(loadings)
+loadings <- loadings[, c("Variable", "PC1", "PC2")]
+
+anova_global <- as.data.frame(anova(mod_pc,
+                                    permutations = ctrl))
+anova_global$Term <- rownames(anova_global)
+rownames(anova_global) <- NULL
+
+anova_margin <- as.data.frame(anova(mod_pc,
+                                    by = "margin",
+                                    permutations = ctrl))
+anova_margin$Predictor <- rownames(anova_margin)
+rownames(anova_margin) <- NULL
+
+write.xlsx(
+  list(
+    "PCA_loadings"           = loadings,
+    "PCA_variance_explained" = var_table
+  ),
+  file = "results/tables/Supplementary_Table_S1_PCA_soil.xlsx",
+  rowNames = FALSE
+)
+
+write.xlsx(
+  list(
+    "dbRDA_global_model"   = anova_global,
+    "dbRDA_marginal_terms" = anova_margin
+  ),
+  file = "results/tables/Supplementary_Table_S2_dbRDA_PC1_PC2.xlsx",
+  rowNames = FALSE
+)
+
+
 
